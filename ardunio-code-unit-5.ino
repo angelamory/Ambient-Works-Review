@@ -26,6 +26,7 @@
  *   - Sensirion I2C SEN66  (Library Manager)
  *   - Sensirion Core       (auto-installed with the above)
  *   - ESP Supabase         (Library Manager)
+ *   - Add Repository - https://espressif.github.io/arduino-esp32/package_esp32_index.json
  */
 
 // ── Pin mapping ────────────────────────────────
