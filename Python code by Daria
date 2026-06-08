@@ -1,0 +1,479 @@
+#!/usr/bin/env python3
+
+"""
+
+ambient_hub.py — the bridge between the Ambient kit and the wings.
+
+
+
+WHAT IT DOES (once per ~second)
+
+  1. gets the VOC Index (+ co2, pm2.5...) from the Ambient kit
+
+  2. reads the latest weight from the Arduino over USB
+
+  3. correlates weight x VOC -> a flap level 0..100
+
+  4. sends "F:<level>" to the Arduino so the wings beat accordingly
+
+  5. logs a merged row to CSV (+ a raw JSONL backup)
+
+
+
+TWO WAYS TO GET THE VOC DATA
+
+  --voc api:http://ambient.local/api      (kit on Wi-Fi, runs Example 4)   <-- the "API"
+
+  --voc serial:/dev/cu.usbserial-KIT      (kit on USB, see note below)
+
+
+
+  For the serial option, the kit must print one machine line per reading:
+
+      AW {"vocIndex":210,"co2":600,"pm2p5":7.8}
+
+  Add this to the kit's loop() (Example 1 or 2), right after readMeasuredValues():
+
+      Serial.printf("AW {\"vocIndex\":%.0f,\"co2\":%u,\"pm2p5\":%.1f}\n",
+
+                    vocIndex, co2, pm2p5);
+
+
+
+ARDUINO (wings) IS ALWAYS ON USB SERIAL:
+
+  --wings /dev/cu.usbmodemXXXX            (the Uno/Nano running wings_scale.ino)
+
+
+
+USAGE EXAMPLES
+
+  # Wi-Fi kit + Arduino, log to a session file:
+
+  python3 ambient_hub.py --voc api:http://ambient.local/api \
+
+                         --wings /dev/cu.usbmodem1101 --out session1.csv
+
+
+
+  # No Wi-Fi (both on USB):
+
+  python3 ambient_hub.py --voc serial:/dev/cu.usbserial-1420 \
+
+                         --wings /dev/cu.usbmodem1101 --out session1.csv
+
+
+
+INSTALL DEPENDENCIES
+
+  pip install pyserial requests
+
+
+
+PORTS:  macOS  -> ls /dev/cu.*      Windows -> COMx      Linux -> /dev/tty*
+
+Close the Arduino IDE Serial Monitor first (one program per port).
+
+"""
+
+
+
+import sys
+
+import csv
+
+import json
+
+import time
+
+import argparse
+
+from datetime import datetime
+
+
+
+try:
+
+    import serial
+
+except ImportError:
+
+    sys.exit("Missing dependency. Run:  pip install pyserial requests")
+
+
+
+# ── Correlation tuning ──────────────────────────────────────
+
+# A 200 kg cell is coarse, so the "bottle present" trigger uses a HYSTERESIS
+
+# band (turns on above ON, off below OFF) to stop the wings chattering at the
+
+# edge. Set these AFTER watching the empty-scale noise (see chat):
+
+#   WEIGHT_ON  ~ a bit ABOVE your empty fluctuation band
+
+#   WEIGHT_OFF ~ a bit below ON
+
+#   WEIGHT_FULL_G = the weight of your heaviest bottle (read it off "W:")
+
+WEIGHT_ON     = 120.0
+
+WEIGHT_OFF    = 80.0
+
+WEIGHT_FULL_G = 1000.0
+
+# VOC Index (Sensirion / Ambient scale 0-500): calm below LOW, max at HIGH.
+
+VOC_LOW   = 150.0   # "Good" ceiling
+
+VOC_HIGH  = 450.0   # "Severe" floor
+
+
+
+CSV_FIELDS = ["host_time", "weight_g", "vocIndex", "co2", "pm2p5",
+
+              "noxIndex", "temperature", "humidity", "flap_level"]
+
+
+
+
+
+def voc_factor(voc_index):
+
+    """VOC Index -> 0..1 across the Good->Severe band."""
+
+    if voc_index <= VOC_LOW:
+
+        return 0.0
+
+    if voc_index >= VOC_HIGH:
+
+        return 1.0
+
+    return (voc_index - VOC_LOW) / (VOC_HIGH - VOC_LOW)
+
+
+
+
+
+def weight_factor(weight_g):
+
+    """Weight -> 0..1, capped at the heaviest bottle."""
+
+    return min(max(weight_g, 0.0) / WEIGHT_FULL_G, 1.0)
+
+
+
+
+
+def flap_level(present, weight_g, voc_index):
+
+    """weight x VOC, both 0..1, multiplied -> 0..100. Gated by presence."""
+
+    if not present:
+
+        return 0
+
+    return int(round(voc_factor(voc_index) * weight_factor(weight_g) * 100))
+
+
+
+
+
+# ── VOC sources ─────────────────────────────────────────────
+
+class ApiSource:
+
+    """Polls the Ambient kit's HTTP /api endpoint."""
+
+    def __init__(self, url):
+
+        try:
+
+            import requests
+
+        except ImportError:
+
+            sys.exit("The api: source needs requests.  Run:  pip install requests")
+
+        self._requests = requests
+
+        self.url = url
+
+
+
+    def read(self):
+
+        try:
+
+            r = self._requests.get(self.url, timeout=2)
+
+            r.raise_for_status()
+
+            return r.json()
+
+        except Exception as e:
+
+            print(f"[voc] API error: {e}")
+
+            return None
+
+
+
+
+
+class SerialSource:
+
+    """Reads lines beginning 'AW ' that contain a JSON object."""
+
+    def __init__(self, port, baud=115200):
+
+        try:
+
+            self.ser = serial.Serial(port, baud, timeout=0.1)
+
+        except serial.SerialException as e:
+
+            sys.exit(f"Could not open kit serial {port}: {e}")
+
+        self.latest = None
+
+
+
+    def read(self):
+
+        # drain everything waiting; keep the most recent valid reading
+
+        while self.ser.in_waiting:
+
+            line = self.ser.readline().decode("utf-8", errors="replace").strip()
+
+            if line.startswith("AW "):
+
+                try:
+
+                    self.latest = json.loads(line[3:])
+
+                except json.JSONDecodeError:
+
+                    pass
+
+        return self.latest
+
+
+
+
+
+def make_voc_source(spec):
+
+    kind, _, rest = spec.partition(":")
+
+    if kind == "api":
+
+        return ApiSource(rest)
+
+    if kind == "serial":
+
+        return SerialSource(rest)
+
+    sys.exit("--voc must look like  api:http://...  or  serial:/dev/cu...")
+
+
+
+
+
+# ── Main loop ───────────────────────────────────────────────
+
+def main():
+
+    ap = argparse.ArgumentParser(description="Bridge Ambient kit -> wings, and log.")
+
+    ap.add_argument("--voc", required=True, help="api:URL  or  serial:PORT")
+
+    ap.add_argument("--wings", required=True, help="Arduino serial port (wings_scale.ino)")
+
+    ap.add_argument("--wings-baud", type=int, default=9600)
+
+    ap.add_argument("--out", default="session.csv")
+
+    ap.add_argument("--interval", type=float, default=1.0, help="seconds between VOC polls")
+
+    args = ap.parse_args()
+
+
+
+    voc_src = make_voc_source(args.voc)
+
+
+
+    try:
+
+        wings = serial.Serial(args.wings, args.wings_baud, timeout=0.1)
+
+    except serial.SerialException as e:
+
+        sys.exit(f"Could not open wings port {args.wings}: {e}\n"
+
+                 f"-> plugged in? Serial Monitor closed?")
+
+
+
+    jsonl_path = args.out.rsplit(".", 1)[0] + ".jsonl"
+
+    csv_file = open(args.out, "w", newline="")
+
+    writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDS)
+
+    writer.writeheader()
+
+    jsonl_file = open(jsonl_path, "w")
+
+
+
+    print(f"Hub running. VOC <- {args.voc}, wings <- {args.wings}")
+
+    print(f"Logging to {args.out} and {jsonl_path}. Ctrl-C to stop.\n")
+
+
+
+    latest_weight = 0.0
+
+    present = False           # hysteresis state for "bottle on the scale"
+
+    next_poll = time.monotonic()
+
+    rows = 0
+
+
+
+    try:
+
+        while True:
+
+            # --- continuously drain weight lines from the Arduino ---
+
+            while wings.in_waiting:
+
+                line = wings.readline().decode("utf-8", errors="replace").strip()
+
+                if line.startswith("W:"):
+
+                    try:
+
+                        latest_weight = float(line[2:])
+
+                    except ValueError:
+
+                        pass
+
+                elif line:
+
+                    print(f"[wings] {line}")   # e.g. "READY"
+
+
+
+            # --- once per interval: poll VOC, correlate, command, log ---
+
+            now = time.monotonic()
+
+            if now >= next_poll:
+
+                next_poll = now + args.interval
+
+                data = voc_src.read()
+
+                if data is None:
+
+                    continue
+
+
+
+                voc = float(data.get("vocIndex", 0) or 0)
+
+
+
+                # presence hysteresis: on above WEIGHT_ON, off below WEIGHT_OFF
+
+                if latest_weight >= WEIGHT_ON:
+
+                    present = True
+
+                elif latest_weight <= WEIGHT_OFF:
+
+                    present = False
+
+
+
+                level = flap_level(present, latest_weight, voc)
+
+                wings.write(f"F:{level}\n".encode())
+
+
+
+                ts = datetime.now().isoformat(timespec="seconds")
+
+                row = {
+
+                    "host_time": ts,
+
+                    "weight_g": round(latest_weight, 1),
+
+                    "vocIndex": voc,
+
+                    "co2": data.get("co2"),
+
+                    "pm2p5": data.get("pm2p5"),
+
+                    "noxIndex": data.get("noxIndex"),
+
+                    "temperature": data.get("temperature"),
+
+                    "humidity": data.get("humidity"),
+
+                    "flap_level": level,
+
+                }
+
+                writer.writerow(row)
+
+                csv_file.flush()
+
+                jsonl_file.write(ts + " " + json.dumps(data) +
+
+                                 f' weight={latest_weight:.1f} flap={level}\n')
+
+                jsonl_file.flush()
+
+                rows += 1
+
+
+
+                print(f"{ts}  {latest_weight:6.1f} g   VOC {voc:5.0f}   "
+
+                      f"flap {level:3d}   (CO2 {data.get('co2')})")
+
+
+
+            time.sleep(0.02)
+
+
+
+    except KeyboardInterrupt:
+
+        wings.write(b"F:0\n")   # park the wings on the way out
+
+        print(f"\nStopped. {rows} rows saved to {args.out}.")
+
+    finally:
+
+        csv_file.close()
+
+        jsonl_file.close()
+
+
+
+
+
+if __name__ == "__main__":
+
+    main()
