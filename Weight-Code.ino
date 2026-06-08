@@ -9,8 +9,8 @@ HX711 scale;
 Servo servo;
 
 float calibration_factor = 16.42;
-float weight_trigger = 100.0; // Initial trigger to move to 180
-float peak_weight = 0.0;      // Stores the highest weight seen while rotated
+float weight_trigger = 100.0; 
+float peak_weight = 0.0;      
 bool isRotated = false;
 
 void setup() {
@@ -31,7 +31,6 @@ void loop() {
   float current_weight = scale.get_units(5); // Faster sampling for peak tracking
 
   // --- PHASE 1: TRIGGER ---
-  // If weight hits the threshold, rotate and start tracking the peak
   if (current_weight >= weight_trigger && !isRotated) {
     Serial.println(">>> Weight Triggered!");
     servo.write(40);
@@ -41,7 +40,6 @@ void loop() {
 
   // --- PHASE 2: PEAK TRACKING & RESET ---
   if (isRotated) {
-    // Update the peak weight if the load keeps increasing
     if (current_weight > peak_weight) {
       peak_weight = current_weight;
     }
