@@ -101,6 +101,6 @@ int fallbackFlapLevel(float current_weight) {
   float poured = peak_weight - current_weight;  
   if (poured <= 0) return 0;
 
-  int level = (int)round((poured / FALLBACK_MAX_POUR_G) * 20);
+  int level = (int)round((poured / FALLBACK_MAX_POUR_G) * 4);
   return constrain(level, 0, 100);
 }
